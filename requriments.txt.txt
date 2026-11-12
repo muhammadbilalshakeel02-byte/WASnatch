@@ -1,0 +1,5 @@
+# WASnatch - runtime requirements
+# Core logic uses the Python standard library only.
+# colorama is optional: it makes ANSI colours work on older Windows consoles.
+
+colorama>=0.4.6

